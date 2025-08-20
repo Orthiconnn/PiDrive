@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PiDrive - File Manager</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .drag-over {
+            background-color: rgba(59, 130, 246, 0.1) !important;
+        }
+        .file-row:hover {
+            background-color: #374151;
+        }
+        .file-row.selected {
+            background-color: #1e40af;
+        }
+        .rename-input {
+            background: #374151;
+            border: 1px solid #3b82f6;
+            border-radius: 4px;
+            padding: 2px 6px;
+            color: white;
+        }
+        body {
+            background-color: #1f2937;
+        }
+    </style>
+</head>
+<body class="bg-gray-800 min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo, memo } = React;
+
+        // Memoized file row component to prevent unnecessary re-renders
+        const FileRow = memo(({ file, isSelected, isRenaming, newFileName, onFileSelect, onFolderDoubleClick, onDownload, onRename, onNewFileNameChange, formatDate, formatFileSize, getFileIcon }) => {
+            return (
+                <div 
+                    className={`file-row px-6 py-2 cursor-pointer transition-colors ${isSelected ? 'selected' : ''}`}
+                    onClick={(e) => {
+                        // Temporary: Single-click navigation for directories during testing
+                        if (file.isDirectory) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            onFolderDoubleClick(file.name);
+                        } else {
+                            onFileSelect(file.name, e);
+                        }
+                    }}
+                    onDoubleClick={(e) => {
+                        // Prevent double-click when using single-click navigation
+                        e.preventDefault();
+                        e.stopPropagation();
+                    }}
+                >
+                    <div className="grid grid-cols-12 gap-4 items-center text-sm">
+                        <div className="col-span-6 flex items-center gap-3">
+                            {getFileIcon(file)}
+                            {isRenaming ? (
+                                <input
+                                    type="text"
+                                    value={newFileName}
+                                    onChange={(e) => onNewFileNameChange(e.target.value)}
+                                    onBlur={() => onRename(file.name, newFileName)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') onRename(file.name, newFileName);
+                                        if (e.key === 'Escape') onRename(file.name, file.name); // Cancel rename
+                                    }}
+                                    className="rename-input flex-1 text-sm"
+                                    autoFocus
+                                />
+                            ) : (
+                                <span className="text-gray-200">{file.name}</span>
+                            )}
+                        </div>
+                        <div className="col-span-3 text-gray-400 text-sm">
+                            {formatDate(file.modified)}
+                        </div>
+                        <div className="col-span-2 text-gray-400 text-sm">
+                            {file.isDirectory ? '--' : formatFileSize(file.size)}
+                        </div>
+                        <div className="col-span-1 text-gray-500 text-xs">
+                            {file.isDirectory ? 'Folder' : file.name.split('.').pop()?.toUpperCase()}
+                        </div>
+                    </div>
+                </div>
+            );
+        });
+
+        function PiDrive() {
+            const [files, setFiles] = useState([]);
+            const [currentPath, setCurrentPath] = useState('');
+            const [loading, setLoading] = useState(false);
+            const [uploading, setUploading] = useState(false);
+            const [dragOver, setDragOver] = useState(false);
+            const [selectedFiles, setSelectedFiles] = useState(new Set());
+            const [renamingFile, setRenamingFile] = useState(null);
+            const [newFileName, setNewFileName] = useState('');
+            const fileInputRef = useRef(null);
+            const [lastFetchTime, setLastFetchTime] = useState(Date.now());
+            const pathRef = useRef(currentPath); // Stable reference to current path
+            
+            // Update pathRef when currentPath changes
+            useEffect(() => {
+                pathRef.current = currentPath;
+            }, [currentPath]);
+
+            const fetchFiles = async (path = currentPath, isAutoRefresh = false) => {
+                try {
+                    const url = path ? `/api/files?path=${encodeURIComponent(path)}` : '/api/files';
+                    
+                    // Don't log on auto-refresh to reduce noise
+                    if (!isAutoRefresh) {
+                        console.log('Fetching files for path:', path, 'URL:', url);
+                    }
+                    
+                    const response = await fetch(url);
+                    
+                    if (!response.ok) {
+                        const error = await response.json();
+                        
+                        // During auto-refresh, ignore temporary mount failures
+                        if (isAutoRefresh && response.status === 404) {
+                            console.log('Mount temporarily unavailable during auto-refresh, retrying...');
+                            // Don't reset state, just skip this refresh cycle
+                            return;
+                        }
+                        
+                        if (!isAutoRefresh) {
+                            console.error('API error:', error);
+                        }
+                        
+                        // Only reset to root for manual navigation failures
+                        if (response.status === 404 && path && !isAutoRefresh) {
+                            console.log('Directory not found, returning to root');
+                            setCurrentPath('');
+                            fetchFiles('');
+                            return;
+                        }
+                        
+                        // During auto-refresh, keep existing files on error
+                        if (!isAutoRefresh) {
+                            setFiles([]);
+                        }
+                        return;
+                    }
+                    
+                    const data = await response.json();
+                    
+                    // Ensure data is an array
+                    if (!Array.isArray(data)) {
+                        console.error('Invalid response format:', data);
+                        if (!isAutoRefresh) {
+                            setFiles([]);
+                        }
+                        return;
+                    }
+                    
+                    const filteredFiles = data.filter(f => !f.name.startsWith('.'));
+                    
+                    // Sort files consistently: directories first, then by name
+                    const sortedFiles = filteredFiles.sort((a, b) => {
+                        if (a.isDirectory && !b.isDirectory) return -1;
+                        if (!a.isDirectory && b.isDirectory) return 1;
+                        return a.name.localeCompare(b.name);
+                    });
+                    
+                    // Only update if files have actually changed
+                    setFiles(prevFiles => {
+                        // Quick length check first
+                        if (prevFiles.length !== sortedFiles.length) {
+                            return sortedFiles;
+                        }
+                        
+                        // Create a hash of the file list for comparison
+                        const createHash = (files) => {
+                            return files.map(f => `${f.name}:${f.size}:${f.modified}:${f.isDirectory}`).join('|');
+                        };
+                        
+                        const oldHash = createHash(prevFiles);
+                        const newHash = createHash(sortedFiles);
+                        
+                        return oldHash !== newHash ? sortedFiles : prevFiles;
+                    });
+                } catch (error) {
+                    console.error('Error fetching files:', error);
+                    // Don't reset to root on network errors, just log them
+                }
+            };
+
+            const handleFileUpload = async (fileList) => {
+                if (!fileList.length) return;
+                
+                setUploading(true);
+                const formData = new FormData();
+                
+                for (let file of fileList) {
+                    formData.append('files', file);
+                }
+
+                try {
+                    const url = currentPath ? `/api/upload?path=${encodeURIComponent(currentPath)}` : '/api/upload';
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (response.ok) {
+                        fetchFiles();
+                    } else {
+                        const error = await response.json();
+                        alert(error.error || 'Upload failed');
+                    }
+                } catch (error) {
+                    console.error('Upload error:', error);
+                    alert('Upload failed: ' + error.message);
+                }
+                setUploading(false);
+            };
+
+            const handleDelete = async (filenames) => {
+                if (!filenames.length) return;
+                
+                const fileList = Array.isArray(filenames) ? filenames : [filenames];
+                const confirmText = fileList.length === 1 
+                    ? `Delete ${fileList[0]}?`
+                    : `Delete ${fileList.length} files?`;
+                    
+                if (!confirm(confirmText)) return;
+                
+                try {
+                    for (const filename of fileList) {
+                        const url = currentPath 
+                            ? `/api/files/${encodeURIComponent(filename)}?path=${encodeURIComponent(currentPath)}`
+                            : `/api/files/${encodeURIComponent(filename)}`;
+                        const response = await fetch(url, {
+                            method: 'DELETE'
+                        });
+                        
+                        if (!response.ok) {
+                            const error = await response.json();
+                            alert(error.error || 'Failed to delete file');
+                            return;
+                        }
+                    }
+                    setSelectedFiles(new Set());
+                    fetchFiles();
+                } catch (error) {
+                    console.error('Delete error:', error);
+                    alert('Delete failed: ' + error.message);
+                }
+            };
+
+            const handleDownload = (filename) => {
+                window.open(`/api/download/${encodeURIComponent(filename)}`, '_blank');
+            };
+
+            const handleRename = async (oldName, newName) => {
+                if (!newName || newName === oldName) {
+                    setRenamingFile(null);
+                    return;
+                }
+                
+                try {
+                    const url = currentPath 
+                        ? `/api/files/${encodeURIComponent(oldName)}?path=${encodeURIComponent(currentPath)}`
+                        : `/api/files/${encodeURIComponent(oldName)}`;
+                    const response = await fetch(url, {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ newName })
+                    });
+                    
+                    if (response.ok) {
+                        fetchFiles();
+                        setSelectedFiles(new Set([newName])); // Update selection to new name
+                    } else {
+                        const error = await response.json();
+                        alert(error.error || 'Failed to rename file');
+                    }
+                } catch (error) {
+                    console.error('Rename error:', error);
+                    alert('Failed to rename file: ' + error.message);
+                }
+                
+                setRenamingFile(null);
+                setNewFileName('');
+            };
+
+            const handleManualRefresh = async () => {
+                try {
+                    const response = await fetch('/api/refresh', {
+                        method: 'POST'
+                    });
+                    
+                    if (response.ok) {
+                        fetchFiles();
+                    } else {
+                        console.error('Manual refresh failed');
+                    }
+                } catch (error) {
+                    console.error('Manual refresh error:', error);
+                }
+            };
+
+            const handleFileSelect = (filename, event) => {
+                const newSelected = new Set(selectedFiles);
+                
+                if (event.metaKey || event.ctrlKey) {
+                    if (newSelected.has(filename)) {
+                        newSelected.delete(filename);
+                    } else {
+                        newSelected.add(filename);
+                    }
+                } else if (event.shiftKey && selectedFiles.size > 0) {
+                    const fileNames = files.map(f => f.name);
+                    const lastSelected = Array.from(selectedFiles)[selectedFiles.size - 1];
+                    const lastIndex = fileNames.indexOf(lastSelected);
+                    const currentIndex = fileNames.indexOf(filename);
+                    const start = Math.min(lastIndex, currentIndex);
+                    const end = Math.max(lastIndex, currentIndex);
+                    
+                    for (let i = start; i <= end; i++) {
+                        newSelected.add(fileNames[i]);
+                    }
+                } else {
+                    newSelected.clear();
+                    newSelected.add(filename);
+                }
+                
+                setSelectedFiles(newSelected);
+            };
+
+            const handleFolderDoubleClick = (folderName) => {
+                if (loading) return; // Prevent navigation during loading
+                
+                console.log('handleFolderDoubleClick called with:', folderName);
+                console.log('Current path before navigation:', currentPath);
+                
+                setLoading(true);
+                const newPath = currentPath ? `${currentPath}/${folderName}` : folderName;
+                console.log('New path calculated:', newPath);
+                
+                setCurrentPath(newPath);
+                setSelectedFiles(new Set());
+                
+                // Use setTimeout to ensure state updates are processed
+                setTimeout(() => {
+                    fetchFiles(newPath).finally(() => setLoading(false));
+                }, 0);
+            };
+
+            const handleBreadcrumbClick = (pathIndex) => {
+                const pathParts = currentPath.split('/').filter(p => p);
+                const newPath = pathParts.slice(0, pathIndex + 1).join('/');
+                setCurrentPath(newPath);
+                setSelectedFiles(new Set());
+                fetchFiles(newPath);
+            };
+
+            const handleBackToRoot = () => {
+                setCurrentPath('');
+                setSelectedFiles(new Set());
+                fetchFiles('');
+            };
+
+            const handleDragOver = (e) => {
+                e.preventDefault();
+                setDragOver(true);
+            };
+
+            const handleDragLeave = (e) => {
+                e.preventDefault();
+                // Only remove drag state if leaving the main container
+                if (!e.currentTarget.contains(e.relatedTarget)) {
+                    setDragOver(false);
+                }
+            };
+
+            const handleDrop = (e) => {
+                e.preventDefault();
+                setDragOver(false);
+                const files = Array.from(e.dataTransfer.files);
+                handleFileUpload(files);
+            };
+
+            const formatFileSize = (bytes) => {
+                if (bytes === 0) return '0 Bytes';
+                const k = 1024;
+                const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+            };
+
+            const formatDate = (dateString) => {
+                const date = new Date(dateString);
+                const now = new Date();
+                const diffTime = Math.abs(now - date);
+                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                
+                if (diffDays === 1) return 'Yesterday';
+                if (diffDays < 7) return date.toLocaleDateString('en-US', { weekday: 'long' });
+                return date.toLocaleDateString('en-US', { 
+                    month: 'short', 
+                    day: 'numeric', 
+                    year: date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined,
+                    hour: 'numeric',
+                    minute: '2-digit'
+                });
+            };
+
+            const getFileIcon = (file) => {
+                if (file.isDirectory) {
+                    return (
+                        <svg className="w-4 h-4 text-blue-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/>
+                        </svg>
+                    );
+                }
+                
+                const ext = file.name.split('.').pop().toLowerCase();
+                
+                if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
+                    return (
+                        <svg className="w-4 h-4 text-purple-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm12 12H4l4-8 3 6 2-4 3 6z" clipRule="evenodd"/>
+                        </svg>
+                    );
+                }
+                
+                if (['mp4', 'mov', 'avi', 'mkv'].includes(ext)) {
+                    return (
+                        <svg className="w-4 h-4 text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z"/>
+                        </svg>
+                    );
+                }
+                
+                return (
+                    <svg className="w-4 h-4 text-gray-400" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd"/>
+                    </svg>
+                );
+            };
+
+            useEffect(() => {
+                fetchFiles(currentPath, false);
+            }, [currentPath]);
+
+            // Smart auto-refresh that preserves navigation state
+            useEffect(() => {
+                const interval = setInterval(() => {
+                    // Use the ref to get the current path without causing re-renders
+                    fetchFiles(pathRef.current, true);
+                }, 2000); // Check every 2 seconds
+
+                return () => clearInterval(interval);
+            }, []); // Empty deps - interval runs for component lifetime
+
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (e.key === 'Delete' || e.key === 'Backspace') {
+                        if (selectedFiles.size > 0) {
+                            handleDelete(Array.from(selectedFiles));
+                        }
+                    }
+                    if (e.key === 'Enter' && selectedFiles.size === 1) {
+                        const filename = Array.from(selectedFiles)[0];
+                        setRenamingFile(filename);
+                        setNewFileName(filename);
+                    }
+                };
+                
+                document.addEventListener('keydown', handleKeyDown);
+                return () => document.removeEventListener('keydown', handleKeyDown);
+            }, [selectedFiles]);
+
+            return (
+                <div 
+                    className={`bg-gray-800 min-h-screen text-white transition-colors ${dragOver ? 'drag-over' : ''}`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                >
+                    {/* Header */}
+                    <div className="bg-gray-900 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="flex gap-2">
+                                <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+                                <div className="w-3 h-3 bg-yellow-500 rounded-full"></div>
+                                <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+                            </div>
+                            <h1 className="text-lg font-medium text-gray-200 ml-4">PiDrive</h1>
+                        </div>
+                        
+                        <div className="flex items-center gap-3">
+                            {selectedFiles.size > 0 && (
+                                <div className="flex items-center gap-3">
+                                    <span className="text-sm text-gray-300">{selectedFiles.size} selected</span>
+                                    <button
+                                        onClick={() => handleDelete(Array.from(selectedFiles))}
+                                        className="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-sm transition-colors"
+                                    >
+                                        Delete
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Breadcrumb Navigation */}
+                    {currentPath && (
+                        <div className="bg-gray-750 border-b border-gray-700 px-6 py-2">
+                            <div className="flex items-center gap-2 text-sm text-gray-300">
+                                <button 
+                                    onClick={handleBackToRoot}
+                                    className="hover:text-blue-400 transition-colors"
+                                >
+                                    PiDrive
+                                </button>
+                                {currentPath.split('/').filter(p => p).map((part, index) => (
+                                    <React.Fragment key={index}>
+                                        <span className="text-gray-500">/</span>
+                                        <button 
+                                            onClick={() => handleBreadcrumbClick(index)}
+                                            className="hover:text-blue-400 transition-colors"
+                                        >
+                                            {part}
+                                        </button>
+                                    </React.Fragment>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* File List Header */}
+                    <div className="bg-gray-850 border-b border-gray-700 px-6 py-2">
+                        <div className="grid grid-cols-12 gap-4 text-xs font-medium text-gray-400 uppercase tracking-wide">
+                            <div className="col-span-6">Name</div>
+                            <div className="col-span-3">Date Modified</div>
+                            <div className="col-span-2">Size</div>
+                            <div className="col-span-1">Kind</div>
+                        </div>
+                    </div>
+
+                    {/* File List */}
+                    <div className="divide-y divide-gray-700">
+                        {files.length === 0 ? (
+                            <div className="px-6 py-16 text-center text-gray-400">
+                                <svg className="mx-auto h-16 w-16 text-gray-500 mb-4" fill="currentColor" viewBox="0 0 20 20">
+                                    <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/>
+                                </svg>
+                                <p className="text-lg text-gray-300">No files yet</p>
+                                <p className="text-sm text-gray-500">Drop files anywhere to upload</p>
+                            </div>
+                        ) : (
+                            files.map((file) => (
+                                <FileRow
+                                    key={currentPath ? `${currentPath}/${file.name}` : file.name}
+                                    file={file}
+                                    isSelected={selectedFiles.has(file.name)}
+                                    isRenaming={renamingFile === file.name}
+                                    newFileName={newFileName}
+                                    onFileSelect={handleFileSelect}
+                                    onFolderDoubleClick={handleFolderDoubleClick}
+                                    onDownload={handleDownload}
+                                    onRename={handleRename}
+                                    onNewFileNameChange={setNewFileName}
+                                    formatDate={formatDate}
+                                    formatFileSize={formatFileSize}
+                                    getFileIcon={getFileIcon}
+                                />
+                            ))
+                        )}
+                    </div>
+
+                    {/* Hidden file input */}
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={(e) => handleFileUpload(e.target.files)}
+                    />
+
+                    {/* Upload indicator */}
+                    {uploading && (
+                        <div className="fixed bottom-4 right-4 bg-blue-600 text-white px-4 py-2 rounded-lg shadow-lg">
+                            <div className="flex items-center gap-2">
+                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                                Uploading files...
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Drag overlay */}
+                    {dragOver && (
+                        <div className="fixed inset-0 bg-blue-600 bg-opacity-20 flex items-center justify-center pointer-events-none">
+                            <div className="bg-gray-800 bg-opacity-90 rounded-lg p-8 border-2 border-dashed border-blue-400">
+                                <div className="text-center text-white">
+                                    <svg className="mx-auto h-16 w-16 text-blue-400 mb-4" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                                        <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                                    </svg>
+                                    <p className="text-xl font-medium">Drop files to upload</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        ReactDOM.render(<PiDrive />, document.getElementById('root'));
+    </script>
+</body>
+</html>

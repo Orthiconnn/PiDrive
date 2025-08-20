@@ -1,0 +1,15 @@
+[Unit]
+Description=SMB Changes Detection for PiDrive
+After=network.target usb-gadget.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/home/orthicon/detect_smb_changes.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
